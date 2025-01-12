@@ -7,7 +7,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 
 	rayv1ac "github.com/ray-project/kuberay/ray-operator/pkg/client/applyconfiguration/ray/v1"
 	. "github.com/ray-project/kuberay/ray-operator/test/support"
@@ -174,4 +176,34 @@ func jobSubmitterPodTemplateApplyConfiguration() *corev1ac.PodTemplateSpecApplyC
 						corev1.ResourceCPU:    resource.MustParse("500m"),
 						corev1.ResourceMemory: resource.MustParse("500Mi"),
 					}))))
+}
+
+// NewRedisDeployment creates a new Redis deployment configuration for testing
+func newRedisDeployment(namespace string) *appsv1ac.DeploymentApplyConfiguration {
+	return appsv1ac.Deployment("redis", namespace).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(1).
+			WithSelector(metav1ac.LabelSelector().WithMatchLabels(map[string]string{"app": "redis"})).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(map[string]string{"app": "redis"}).
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(corev1ac.Container().
+						WithName("redis").
+						WithImage("redis:7.4").
+						WithPorts(corev1ac.ContainerPort().WithContainerPort(6379)).
+						WithCommand("redis-server", "--requirepass", "5241590000000000"),
+					),
+				),
+			),
+		)
+}
+func newRedisService(namespace string) *corev1ac.ServiceApplyConfiguration {
+	return corev1ac.Service("redis", namespace).
+		WithSpec(corev1ac.ServiceSpec().
+			WithType(corev1.ServiceTypeClusterIP).
+			WithSelector(map[string]string{"app": "redis"}).
+			WithPorts(corev1ac.ServicePort().
+				WithPort(6379),
+			),
+		)
 }

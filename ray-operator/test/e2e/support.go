@@ -178,7 +178,6 @@ func jobSubmitterPodTemplateApplyConfiguration() *corev1ac.PodTemplateSpecApplyC
 					}))))
 }
 
-// NewRedisDeployment creates a new Redis deployment configuration for testing
 func newRedisDeployment(namespace string) *appsv1ac.DeploymentApplyConfiguration {
 	return appsv1ac.Deployment("redis", namespace).
 		WithSpec(appsv1ac.DeploymentSpec().
@@ -197,6 +196,7 @@ func newRedisDeployment(namespace string) *appsv1ac.DeploymentApplyConfiguration
 			),
 		)
 }
+
 func newRedisService(namespace string) *corev1ac.ServiceApplyConfiguration {
 	return corev1ac.Service("redis", namespace).
 		WithSpec(corev1ac.ServiceSpec().

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-release_submitter_image:
+  release_submitter_image:
     env:
       working-directory: ./ray-operator
     name: Release Submitter Docker Images

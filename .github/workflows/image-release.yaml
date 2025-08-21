@@ -70,7 +70,7 @@ jobs:
       uses: docker/build-push-action@v5
       env:
         PUSH: true
-        REPO_ORG: kuberay
+        REPO_ORG: owenowenisme
         REPO_NAME: submitter
       with:
         platforms: linux/amd64,linux/arm64
@@ -78,6 +78,6 @@ jobs:
         file: ${{env.working-directory}}/Dockerfile.submitter.buildx
         push: ${{env.PUSH}}
         provenance: false
-        tags: |
+        tags: | # This is just for testing purposes, set to my username
           ghcr.io/${{env.REPO_ORG}}/${{env.REPO_NAME}}:${{ steps.vars.outputs.sha_short }}
           ghcr.io/${{env.REPO_ORG}}/${{env.REPO_NAME}}:${{ env.tag }}

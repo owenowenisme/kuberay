@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	cmap "github.com/orcaman/concurrent-map/v2"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -25,12 +27,13 @@ var (
 )
 
 type RayDashboardClientInterface interface {
-	InitClient(client *http.Client, dashboardURL string)
+	InitClient(client *http.Client, dashboardURL string, jobInfoMap *cmap.ConcurrentMap[string, *JobInfoCache])
 	UpdateDeployments(ctx context.Context, configJson []byte) error
 	// V2/multi-app Rest API
 	GetServeDetails(ctx context.Context) (*utiltypes.ServeDetails, error)
 	GetMultiApplicationStatus(context.Context) (map[string]*utiltypes.ServeApplicationStatus, error)
 	GetJobInfo(ctx context.Context, jobId string) (*utiltypes.RayJobInfo, error)
+	StartJobInfoCache(ctx context.Context, jobId string)
 	ListJobs(ctx context.Context) (*[]utiltypes.RayJobInfo, error)
 	SubmitJob(ctx context.Context, rayJob *rayv1.RayJob) (string, error)
 	SubmitJobReq(ctx context.Context, request *utiltypes.RayJobRequest) (string, error)
@@ -42,11 +45,18 @@ type RayDashboardClientInterface interface {
 type RayDashboardClient struct {
 	client       *http.Client
 	dashboardURL string
+	jobInfoMap   *cmap.ConcurrentMap[string, *JobInfoCache]
+}
+type JobInfoCache struct {
+	JobInfo *utiltypes.RayJobInfo
+	Ctx     context.Context
+	Err     error
 }
 
-func (r *RayDashboardClient) InitClient(client *http.Client, dashboardURL string) {
+func (r *RayDashboardClient) InitClient(client *http.Client, dashboardURL string, jobInfoMap *cmap.ConcurrentMap[string, *JobInfoCache]) {
 	r.client = client
 	r.dashboardURL = dashboardURL
+	r.jobInfoMap = jobInfoMap
 }
 
 // UpdateDeployments update the deployments in the Ray cluster.
@@ -160,7 +170,39 @@ func (r *RayDashboardClient) GetJobInfo(ctx context.Context, jobId string) (*uti
 
 	return &jobInfo, nil
 }
+func (r *RayDashboardClient) StartJobInfoCache(ctx context.Context, jobId string) {
+	go func() {
+		for {
+			// Check if context is cancelled
+			if ctx.Err() != nil {
+				return
+			}
 
+			jobInfo, err := r.GetJobInfo(ctx, jobId)
+			if err != nil {
+				r.jobInfoMap.Set(jobId, &JobInfoCache{JobInfo: nil, Ctx: ctx, Err: err})
+				// stop this goroutine
+				return
+			} else if jobInfo != nil {
+				r.jobInfoMap.Set(jobId, &JobInfoCache{JobInfo: jobInfo, Ctx: ctx, Err: nil})
+
+				// Stop if job is done
+				if rayv1.IsJobTerminal(jobInfo.JobStatus) {
+					return
+				}
+			}
+
+			// Wait before next check
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+				// Continue to next iteration
+				continue
+			}
+		}
+	}()
+}
 func (r *RayDashboardClient) ListJobs(ctx context.Context) (*[]utiltypes.RayJobInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.dashboardURL+JobPath, nil)
 	if err != nil {

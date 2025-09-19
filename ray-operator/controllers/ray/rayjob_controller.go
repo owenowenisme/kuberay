@@ -3,12 +3,8 @@ package ray
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
 	"github.com/go-logr/logr"
+	cmap "github.com/orcaman/concurrent-map/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -17,12 +13,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	"os"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"strconv"
+	"strings"
+	"time"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
@@ -32,6 +32,8 @@ import (
 	"github.com/ray-project/kuberay/ray-operator/pkg/features"
 )
 
+var time_spend_on_dashboard_client time.Duration = 0
+
 const (
 	RayJobDefaultRequeueDuration = 3 * time.Second
 	PythonUnbufferedEnvVarName   = "PYTHONUNBUFFERED"
@@ -40,9 +42,9 @@ const (
 // RayJobReconciler reconciles a RayJob object
 type RayJobReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
-
+	Scheme              *runtime.Scheme
+	Recorder            record.EventRecorder
+	JobInfoMap          *cmap.ConcurrentMap[string, *dashboardclient.JobInfoCache]
 	dashboardClientFunc func(rayCluster *rayv1.RayCluster, url string) (dashboardclient.RayDashboardClientInterface, error)
 	options             RayJobReconcilerOptions
 }
@@ -53,11 +55,13 @@ type RayJobReconcilerOptions struct {
 
 // NewRayJobReconciler returns a new reconcile.Reconciler
 func NewRayJobReconciler(_ context.Context, mgr manager.Manager, options RayJobReconcilerOptions, provider utils.ClientProvider) *RayJobReconciler {
-	dashboardClientFunc := provider.GetDashboardClient(mgr)
+	JobInfoMap := cmap.New[*dashboardclient.JobInfoCache]()
+	dashboardClientFunc := provider.GetDashboardClient(mgr, &JobInfoMap)
 	return &RayJobReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		Recorder:            mgr.GetEventRecorderFor("rayjob-controller"),
+		JobInfoMap:          &JobInfoMap,
 		dashboardClientFunc: dashboardClientFunc,
 		options:             options,
 	}
@@ -263,22 +267,35 @@ func (r *RayJobReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		if err != nil {
 			return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 		}
-
-		jobInfo, err := rayDashboardClient.GetJobInfo(ctx, rayJobInstance.Status.JobId)
-		if err != nil {
-			// If the Ray job was not found, GetJobInfo returns a BadRequest error.
-			if rayJobInstance.Spec.SubmissionMode == rayv1.HTTPMode && errors.IsBadRequest(err) {
-				logger.Info("The Ray job was not found. Submit a Ray job via an HTTP request.", "JobId", rayJobInstance.Status.JobId)
-				if _, err := rayDashboardClient.SubmitJob(ctx, rayJobInstance); err != nil {
-					logger.Error(err, "Failed to submit the Ray job", "JobId", rayJobInstance.Status.JobId)
-					return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
+		start_time := time.Now().Unix()
+		jobInfoCache, ok := r.JobInfoMap.Get(rayJobInstance.Status.JobId)
+		if !ok {
+			jobInfo, err := rayDashboardClient.GetJobInfo(ctx, rayJobInstance.Status.JobId)
+			if err != nil {
+				// If the Ray job was not found, GetJobInfo returns a BadRequest error.
+				if rayJobInstance.Spec.SubmissionMode == rayv1.HTTPMode && errors.IsBadRequest(err) {
+					logger.Info("The Ray job was not found. Submit a Ray job via an HTTP request.", "JobId", rayJobInstance.Status.JobId)
+					if _, err := rayDashboardClient.SubmitJob(ctx, rayJobInstance); err != nil {
+						logger.Error(err, "Failed to submit the Ray job", "JobId", rayJobInstance.Status.JobId)
+						return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
+					}
+					return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, nil
 				}
-				return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, nil
+				logger.Error(err, "Failed to get job info", "JobId", rayJobInstance.Status.JobId)
+				end_time := time.Now().Unix()
+				time_spend_on_dashboard_client += time.Duration(end_time-start_time) * time.Second
+				logger.Info("Time spend on dashboard client", "time", time_spend_on_dashboard_client, "start_time", start_time, "end_time", end_time)
+				return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 			}
-			logger.Error(err, "Failed to get job info", "JobId", rayJobInstance.Status.JobId)
-			return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
+			jobInfoCache = &dashboardclient.JobInfoCache{JobInfo: jobInfo, Ctx: ctx, Err: err}
+			r.JobInfoMap.Set(rayJobInstance.Status.JobId, jobInfoCache)
+			rayDashboardClient.StartJobInfoCache(ctx, rayJobInstance.Status.JobId)
 		}
+		end_time := time.Now().Unix()
+		time_spend_on_dashboard_client += time.Duration(end_time-start_time) * time.Second
+		logger.Info("Time spend on dashboard client", "time", time_spend_on_dashboard_client, "start_time", start_time, "end_time", end_time)
 
+		jobInfo := jobInfoCache.JobInfo
 		// If the JobStatus is in a terminal status, such as SUCCEEDED, FAILED, or STOPPED, it is impossible for the Ray job
 		// to transition to any other. Additionally, RayJob does not currently support retries. Hence, we can mark the RayJob
 		// as "Complete" or "Failed" to avoid unnecessary reconciliation.
@@ -443,6 +460,12 @@ func (r *RayJobReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 			if err != nil {
 				return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 			}
+		}
+
+		jobInfoCache, ok := r.JobInfoMap.Get(rayJobInstance.Status.JobId)
+		if ok {
+			jobInfoCache.Ctx.Done() //clear up
+			r.JobInfoMap.Remove(rayJobInstance.Status.JobId)
 		}
 
 		// If the RayJob is completed, we should not requeue it.
